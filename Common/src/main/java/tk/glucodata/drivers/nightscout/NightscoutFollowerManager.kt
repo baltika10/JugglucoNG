@@ -81,6 +81,14 @@ class NightscoutFollowerManager(
      */
     private val refreshGeneration = AtomicLong(0L)
     @Volatile private var lastProgressUptime: Long = 0L
+    /**
+     * The generation of the refresh running on the calling thread. An abandoned refresh keeps
+     * running on its old thread; this is what stops its progress from counting as progress of
+     * the replacement, which could then stall unnoticed.
+     */
+    private val threadRefreshGeneration = ThreadLocal<Long>()
+    /** Publication is one step under one gate, so a refresh's currency is checked as it publishes. */
+    private val publishGate = NightscoutFollowerPublishGate()
     @Volatile private var lastRefreshStartedElapsed: Long = 0L
     @Volatile private var lastRefreshFinishedElapsed: Long = 0L
     /** A poll alarm's wakelock that arrived while a refresh was already running. */
@@ -402,6 +410,8 @@ class NightscoutFollowerManager(
         HandlerThread("NightscoutFollower-$SerialNumber").also { it.start() }
 
     private fun noteProgress() {
+        val reporting = threadRefreshGeneration.get()
+        if (!NightscoutFollowerRecoveryPolicy.acceptsProgress(reporting, refreshGeneration.get())) return
         lastProgressUptime = SystemClock.uptimeMillis()
     }
 
@@ -478,10 +488,12 @@ class NightscoutFollowerManager(
     }
 
     private fun runRefresh(reason: String, generation: Long, wakelock: PowerManager.WakeLock?) {
+        threadRefreshGeneration.set(generation)
         try {
             noteProgress()
             refresh(reason, generation)
         } finally {
+            threadRefreshGeneration.remove()
             synchronized(refreshLock) {
                 if (refreshGeneration.get() == generation) {
                     refreshQueuedOrRunning.set(false)
@@ -509,7 +521,7 @@ class NightscoutFollowerManager(
             // 512 treatments, 512 finger sticks and devicestatus downloading behind it.
             val outcome = NightscoutFollowerRefreshSequence.run(
                 fetch = ::fetchReadings,
-                publish = { fetched -> publishFetched(fetched, reason) },
+                publish = { fetched -> publishFetched(fetched, reason, generation) },
                 enrich = {
                     noteProgress()
                     importRemoteTreatments()
@@ -552,18 +564,30 @@ class NightscoutFollowerManager(
         }
     }
 
-    private fun publishFetched(fetched: FetchedReadings, reason: String) {
+    /**
+     * The sequence checks the refresh is current before calling this, but storing history can
+     * take long enough for the refresh to be abandoned and replaced in the meantime. Each
+     * visible write therefore checks again, through the gate, at the moment it happens; an
+     * abandoned refresh resuming late cannot put its older reading or status over the newer one.
+     */
+    private fun publishFetched(fetched: FetchedReadings, reason: String, generation: Long) {
+        val current = { isCurrent(generation) }
         val readings = fetched.latestReadings
         if (readings.isEmpty()) {
-            setStatus(Phase.IDLE, localizedString(R.string.nightscout_follow_status_no_readings, "No Nightscout readings yet"))
+            publishGate.publishIfCurrent(current) {
+                setStatus(Phase.IDLE, localizedString(R.string.nightscout_follow_status_no_readings, "No Nightscout readings yet"))
+            }
             return
         }
         if (!fetched.historyImported) {
             importHistory(readings)
         }
-        publishLatest(readings)
-        bootstrapHistoryPending = false
-        setStatus(Phase.FOLLOWING, localizedString(R.string.nightscout_follow_status_following, "Following Nightscout"))
+        val published = publishGate.publishIfCurrent(current) {
+            publishLatest(readings)
+            bootstrapHistoryPending = false
+            setStatus(Phase.FOLLOWING, localizedString(R.string.nightscout_follow_status_following, "Following Nightscout"))
+        }
+        if (!published) return
         Log.i(
             TAG,
             String.format(
@@ -877,6 +901,24 @@ internal object NightscoutFollowerRefreshSequence {
         }
         return if (isCurrent()) Outcome.COMPLETED else Outcome.SUPERSEDED
     }
+}
+
+/**
+ * Serializes publication and checks, inside it, that the publishing refresh is still current.
+ *
+ * Checking before the call is not enough: between that check and the write the refresh can be
+ * abandoned and its replacement can publish. Because the replacement only exists after the
+ * generation moved on, a refresh that is current inside the gate has nothing newer to overwrite.
+ */
+internal class NightscoutFollowerPublishGate {
+    private val lock = Any()
+
+    fun publishIfCurrent(isCurrent: () -> Boolean, publish: () -> Unit): Boolean =
+        synchronized(lock) {
+            if (!isCurrent()) return false
+            publish()
+            true
+        }
 }
 
 internal object NightscoutFollowerJournalEndpoints {

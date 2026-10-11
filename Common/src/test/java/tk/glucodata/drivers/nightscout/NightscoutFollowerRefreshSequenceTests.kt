@@ -1,6 +1,10 @@
 package tk.glucodata.drivers.nightscout
 
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -89,5 +93,53 @@ class NightscoutFollowerRefreshSequenceTests {
         } catch (expected: IllegalStateException) {
             assertEquals("entries HTTP 401", expected.message)
         }
+    }
+
+    // ---------- publish gate ----------
+
+    @Test
+    fun refreshAbandonedWhileStoringHistoryCannotPublishOverItsReplacement() {
+        // The sequence saw the old refresh as current before publishing; it then stalled while
+        // storing history, was abandoned, and its replacement published a newer reading.
+        val gate = NightscoutFollowerPublishGate()
+        var generation = 1L
+        var shown = "none"
+        val oldGeneration = generation
+
+        generation++ // abandoned
+        assertTrue(gate.publishIfCurrent({ generation == 2L }) { shown = "new" })
+        val oldPublished = gate.publishIfCurrent({ generation == oldGeneration }) { shown = "old" }
+
+        assertFalse(oldPublished)
+        assertEquals("new", shown)
+    }
+
+    @Test
+    fun replacementWaitsForAPublishAlreadyInProgress() {
+        // Abandoned mid-write: the old refresh was current when it entered the gate and
+        // finishes; the replacement publishes after it, so the newer value is the one left.
+        val gate = NightscoutFollowerPublishGate()
+        val shown = mutableListOf<String>()
+        val oldInside = CountDownLatch(1)
+        val releaseOld = CountDownLatch(1)
+
+        val old = thread {
+            gate.publishIfCurrent({ true }) {
+                oldInside.countDown()
+                releaseOld.await(5, TimeUnit.SECONDS)
+                synchronized(shown) { shown += "old" }
+            }
+        }
+        assertTrue(oldInside.await(5, TimeUnit.SECONDS))
+        val replacement = thread {
+            gate.publishIfCurrent({ true }) { synchronized(shown) { shown += "new" } }
+        }
+        Thread.sleep(50)
+        synchronized(shown) { assertTrue("replacement published inside the old write", shown.isEmpty()) }
+        releaseOld.countDown()
+        old.join(5_000)
+        replacement.join(5_000)
+
+        assertEquals(listOf("old", "new"), shown)
     }
 }

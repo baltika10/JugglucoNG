@@ -187,7 +187,8 @@ object NightscoutFollowerRegistry {
      * off frees every callback, the follower included, although it never used Bluetooth; that
      * also cancels its alarm, so nothing would poll again until the network changed.
      */
-    fun ensureFollowerRunning(context: Context) {
+    fun ensureFollowerRunning(context: Context?) {
+        context ?: return
         val config = loadConfig(context)
         if (!config.isUsable) return
         if (findRunningFollower(config.sensorId) != null) return

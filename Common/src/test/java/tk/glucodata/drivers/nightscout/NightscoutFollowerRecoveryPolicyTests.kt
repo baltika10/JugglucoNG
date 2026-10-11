@@ -120,6 +120,24 @@ class NightscoutFollowerRecoveryPolicyTests {
         assertFalse(NightscoutFollowerRecoveryPolicy.isStalled(500_000L, 1_000L))
     }
 
+    @Test
+    fun progressFromTheCurrentRefreshCounts() {
+        assertTrue(NightscoutFollowerRecoveryPolicy.acceptsProgress(reportingGeneration = 7L, currentGeneration = 7L))
+    }
+
+    @Test
+    fun progressOutsideAnyRefreshCounts() {
+        // Queueing a refresh marks progress from the main thread, which runs no refresh.
+        assertTrue(NightscoutFollowerRecoveryPolicy.acceptsProgress(reportingGeneration = null, currentGeneration = 7L))
+    }
+
+    @Test
+    fun progressFromAnAbandonedRefreshDoesNotHideANewStall() {
+        // The abandoned refresh keeps paging history on its old thread. If its marks counted,
+        // a stalled replacement would look busy and polling would stay blocked.
+        assertFalse(NightscoutFollowerRecoveryPolicy.acceptsProgress(reportingGeneration = 6L, currentGeneration = 7L))
+    }
+
     // ---------- foreground refresh ----------
 
     @Test

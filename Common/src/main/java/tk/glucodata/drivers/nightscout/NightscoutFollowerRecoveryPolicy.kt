@@ -50,6 +50,14 @@ object NightscoutFollowerRecoveryPolicy {
         return nowUptime - lastProgressUptime >= stallMillis.coerceAtLeast(0L)
     }
 
+    /**
+     * Whether a progress mark counts. Marks from outside any refresh (queueing one, for
+     * instance) always do; a mark from a refresh counts only while that refresh is the current
+     * generation, so an abandoned one still running cannot hide a stall in its replacement.
+     */
+    fun acceptsProgress(reportingGeneration: Long?, currentGeneration: Long): Boolean =
+        reportingGeneration == null || reportingGeneration == currentGeneration
+
     fun shouldRefreshOnForeground(
         lastRefreshStartedElapsed: Long,
         nowElapsedRealtime: Long,
